@@ -1,0 +1,15 @@
+# Single 'agent' service. restart: unless-stopped is the only supervision layer.
+# Dashboard runs inside same process, Tailscale-only. See spec §6.2.
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+    ports:
+      - "127.0.0.1:3000:3000"

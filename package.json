@@ -1,0 +1,42 @@
+{
+  "name": "coinboi",
+  "version": "0.0.1",
+  "description": "Autonomous Solana spot trading agent with hard safety constraints enforced below the LLM.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --enable-source-maps dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "paper-trade": "tsx scripts/paper-trade.ts",
+    "reconcile": "tsx scripts/reconcile.ts",
+    "halt": "tsx scripts/halt.ts",
+    "fund-check": "tsx scripts/fund-check.ts",
+    "setup-wallet": "tsx scripts/setup-wallet.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.1",
+    "async-mutex": "^0.5.0",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "node-telegram-bot-api": "^0.66.0",
+    "pino": "^9.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^5.0.0",
+    "@types/node": "^20.16.10",
+    "@types/node-telegram-bot-api": "^0.64.7",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.2"
+  }
+}
