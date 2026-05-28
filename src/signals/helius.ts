@@ -66,6 +66,9 @@ const transactionSchema = z.object({
 export interface HeliusClientOptions {
   rpcUrl?: string;
   fetchFn?: typeof fetch;
+  // Wallet public key used to identify OUR accounts in a transaction.
+  // Falls back to process.env.WALLET_PUBLIC_KEY if omitted.
+  walletPublicKey?: string;
 }
 
 function getRpcUrl(opts?: HeliusClientOptions): string {
@@ -137,17 +140,23 @@ export async function pollUntilFinalized(
 }
 
 // ── parseSwap — extract actual on-chain amounts from a confirmed swap tx ──────
-// Parses token balance deltas for the wallet's USDC and the swapped token.
-// The USDC mint address is hard-coded (mainnet only). See spec §2.8.
+// Identifies OUR accounts by cross-referencing transaction.message.accountKeys
+// against WALLET_PUBLIC_KEY (from opts or env). This is safe when we are not
+// the fee payer (e.g., Jupiter fee-payer abstraction puts a program at index 0).
 
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const LAMPORTS_PER_SOL = 1_000_000_000;
-const SOL_PRICE_USDC_FALLBACK = 150; // conservative fallback for fee estimation
+const SOL_PRICE_USDC_FALLBACK = 150; // rough fallback for cost-basis fee estimation
 
 export async function parseSwap(
   sig: string,
   opts: HeliusClientOptions = {}
 ): Promise<ParsedSwap> {
+  const walletPubkey = opts.walletPublicKey ?? process.env['WALLET_PUBLIC_KEY'];
+  if (!walletPubkey) {
+    throw new Error('parseSwap: WALLET_PUBLIC_KEY not set — cannot identify wallet accounts');
+  }
+
   const raw = await rpcCall(
     'getTransaction',
     [sig, { encoding: 'json', commitment: 'finalized', maxSupportedTransactionVersion: 0 }],
@@ -156,7 +165,10 @@ export async function parseSwap(
 
   const parsed = transactionSchema.safeParse(raw);
   if (!parsed.success || !parsed.data.result) {
-    throw new Error(`parseSwap: could not decode transaction ${sig}: ${JSON.stringify(parsed.error ?? 'null result')}`);
+    throw new Error(
+      `parseSwap: could not decode transaction ${sig}: ` +
+      JSON.stringify(parsed.error ?? 'null result')
+    );
   }
 
   const { meta, transaction } = parsed.data.result;
@@ -165,46 +177,64 @@ export async function parseSwap(
     throw new Error(`parseSwap: transaction ${sig} failed on-chain: ${JSON.stringify(meta.err)}`);
   }
 
-  // Find the wallet's USDC balance change (index 0 = fee payer = our wallet)
-  const walletIndex = 0;
+  // Find every account index belonging to our wallet.
+  // accountKeys is an array of base58 public keys; our wallet may appear at
+  // multiple indices (main account + ATAs can share the owner's pubkey in the
+  // preTokenBalances owner field, but here we match by the key list position).
+  const accountKeys: string[] = transaction.message.accountKeys;
+  const walletIndices = new Set<number>();
+  accountKeys.forEach((key, idx) => {
+    if (key === walletPubkey) walletIndices.add(idx);
+  });
 
-  const preUsdc = meta.preTokenBalances.find(
-    b => b.accountIndex === walletIndex && b.mint === USDC_MINT
-  )?.uiTokenAmount.uiAmount ?? 0;
-  const postUsdc = meta.postTokenBalances.find(
-    b => b.accountIndex === walletIndex && b.mint === USDC_MINT
-  )?.uiTokenAmount.uiAmount ?? 0;
+  if (walletIndices.size === 0) {
+    // Wallet not in account list at all — should never happen for a swap we sent
+    throw new Error(
+      `parseSwap: wallet ${walletPubkey} not found in transaction account keys for ${sig}`
+    );
+  }
 
-  const usdcDelta = postUsdc - preUsdc;
+  // Sum USDC deltas across all our wallet indices
+  let preUsdcTotal = 0;
+  let postUsdcTotal = 0;
+  for (const idx of walletIndices) {
+    preUsdcTotal += meta.preTokenBalances.find(
+      b => b.accountIndex === idx && b.mint === USDC_MINT
+    )?.uiTokenAmount.uiAmount ?? 0;
+    postUsdcTotal += meta.postTokenBalances.find(
+      b => b.accountIndex === idx && b.mint === USDC_MINT
+    )?.uiTokenAmount.uiAmount ?? 0;
+  }
+  const usdcDelta = postUsdcTotal - preUsdcTotal;
 
-  // Find the non-USDC token balance change for the wallet
+  // Sum non-USDC token deltas across our wallet indices
   const walletTokenPre = meta.preTokenBalances.filter(
-    b => b.accountIndex === walletIndex && b.mint !== USDC_MINT
+    b => walletIndices.has(b.accountIndex) && b.mint !== USDC_MINT
   );
   const walletTokenPost = meta.postTokenBalances.filter(
-    b => b.accountIndex === walletIndex && b.mint !== USDC_MINT
+    b => walletIndices.has(b.accountIndex) && b.mint !== USDC_MINT
   );
 
-  // Match by mint address
+  // Find the mint with the largest absolute change — that's the swapped token
   const allMints = new Set([
     ...walletTokenPre.map(b => b.mint),
     ...walletTokenPost.map(b => b.mint),
   ]);
-  allMints.delete(USDC_MINT);
 
   let tokenAmount = 0;
   for (const mint of allMints) {
-    const pre = walletTokenPre.find(b => b.mint === mint)?.uiTokenAmount.uiAmount ?? 0;
-    const post = walletTokenPost.find(b => b.mint === mint)?.uiTokenAmount.uiAmount ?? 0;
+    const pre = walletTokenPre
+      .filter(b => b.mint === mint)
+      .reduce((s, b) => s + (b.uiTokenAmount.uiAmount ?? 0), 0);
+    const post = walletTokenPost
+      .filter(b => b.mint === mint)
+      .reduce((s, b) => s + (b.uiTokenAmount.uiAmount ?? 0), 0);
     const delta = post - pre;
-    if (Math.abs(delta) > Math.abs(tokenAmount)) {
-      tokenAmount = delta;
-    }
+    if (Math.abs(delta) > Math.abs(tokenAmount)) tokenAmount = delta;
   }
 
-  // SOL fee in USDC equivalent (rough — used only for cost-basis tracking)
-  const lamportFee = meta.fee;
-  const feeUsdc = (lamportFee / LAMPORTS_PER_SOL) * SOL_PRICE_USDC_FALLBACK;
+  // SOL fee in USDC equivalent — rough, for cost-basis only
+  const feeUsdc = (meta.fee / LAMPORTS_PER_SOL) * SOL_PRICE_USDC_FALLBACK;
 
   return {
     usdcAmount: Math.abs(usdcDelta),

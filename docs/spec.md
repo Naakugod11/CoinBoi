@@ -1173,4 +1173,6 @@ For anyone reading both versions back-to-back:
 11. Chaos tests — gate for deploy
 12. Paper trade 24h, then go live
 
-Do not skip the chaos tests. They are the difference between an agent that runs and an agent that desyncs on day 3.
+Do not skip the chaos tests. They are the difference between an agent that runs and an agent that desyncs on day 3.- price-oracle PYTH_PRICE_ACCOUNTS uses placeholder addresses; fill real
+  Pyth price feed IDs/accounts (verify pull-oracle feed-ID vs account-address
+  semantics) before live. Data, not logic.

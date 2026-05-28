@@ -143,6 +143,7 @@ function makeRequest(decisionId: number, overrides: Partial<TxRequest> = {}): Tx
 }
 
 const HELIUS_URL = 'https://fake-helius.example.com/';
+const WALLET_PUBKEY = 'WalletPubkey111111111111111111111111111111111';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -188,7 +189,7 @@ describe('tx-pipeline', () => {
 
     const deps: TxPipelineDeps = {
       executor,
-      heliusOpts: { rpcUrl: HELIUS_URL, fetchFn: makeHeliusFetch({}) },
+      heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY, fetchFn: makeHeliusFetch({}) },
     };
 
     await execute(makeRequest(decisionId), deps);
@@ -200,7 +201,7 @@ describe('tx-pipeline', () => {
   it('transitions intent PENDING → SENT → CONFIRMED on happy path', async () => {
     const deps: TxPipelineDeps = {
       executor: makeExecutor(),
-      heliusOpts: { rpcUrl: HELIUS_URL, fetchFn: makeHeliusFetch({}) },
+      heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY, fetchFn: makeHeliusFetch({}) },
     };
 
     const result = await execute(makeRequest(decisionId), deps);
@@ -218,7 +219,7 @@ describe('tx-pipeline', () => {
   it('trade row records on-chain amounts, not quote amounts', async () => {
     const deps: TxPipelineDeps = {
       executor: makeExecutor(),
-      heliusOpts: { rpcUrl: HELIUS_URL, fetchFn: makeHeliusFetch({}) },
+      heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY, fetchFn: makeHeliusFetch({}) },
     };
 
     const result = await execute(makeRequest(decisionId), deps);
@@ -245,6 +246,7 @@ describe('tx-pipeline', () => {
       executor,
       heliusOpts: {
         rpcUrl: HELIUS_URL,
+        walletPublicKey: WALLET_PUBKEY,
         fetchFn: makeHeliusFetch({ timeoutAll: true }),
         timeoutMs: 80,
         pollIntervalMs: 20,
@@ -274,7 +276,7 @@ describe('tx-pipeline', () => {
     });
     const deps: TxPipelineDeps = {
       executor,
-      heliusOpts: { rpcUrl: HELIUS_URL },
+      heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY },
     };
 
     const result = await execute(makeRequest(decisionId), deps);
@@ -305,7 +307,7 @@ describe('tx-pipeline', () => {
 
     const deps: TxPipelineDeps = {
       executor,
-      heliusOpts: { rpcUrl: HELIUS_URL, fetchFn: crashFetch },
+      heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY, fetchFn: crashFetch },
     };
 
     await expect(execute(makeRequest(decisionId), deps)).rejects.toThrow('simulated crash');
@@ -322,7 +324,7 @@ describe('tx-pipeline', () => {
   it('marks CHAIN_FAILED when chain confirms a failure', async () => {
     const deps: TxPipelineDeps = {
       executor: makeExecutor(),
-      heliusOpts: { rpcUrl: HELIUS_URL, fetchFn: makeHeliusFetch({ shouldFail: true }) },
+      heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY, fetchFn: makeHeliusFetch({ shouldFail: true }) },
     };
 
     const result = await execute(makeRequest(decisionId), deps);
