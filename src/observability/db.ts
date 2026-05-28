@@ -477,6 +477,14 @@ export function insertError(context: string, message: string, stack?: string): v
   `).run(nowUtc(), context, message, stack ?? null);
 }
 
+// ── Recent decisions for prompt context ──────────────────────────────────────
+
+export function getRecentDecisions(n: number): DecisionRow[] {
+  return getDb()
+    .prepare('SELECT * FROM decisions ORDER BY timestamp_utc DESC LIMIT ?')
+    .all(n) as DecisionRow[];
+}
+
 // ── Trade window counter — spec §1 rolling 24h cap ───────────────────────────
 
 export function countTradesInWindow(windowSeconds: number): number {
