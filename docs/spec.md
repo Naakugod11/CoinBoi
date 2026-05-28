@@ -1176,3 +1176,7 @@ For anyone reading both versions back-to-back:
 Do not skip the chaos tests. They are the difference between an agent that runs and an agent that desyncs on day 3.- price-oracle PYTH_PRICE_ACCOUNTS uses placeholder addresses; fill real
   Pyth price feed IDs/accounts (verify pull-oracle feed-ID vs account-address
   semantics) before live. Data, not logic.
+- §2.7 clarification (Day 3): safety loop's portfolio reader must include
+  wallet USDC balance, not just open positions. Empty-position state with
+  cash-only otherwise reads as -100% drawdown and triggers spurious hard
+  stop on startup.
