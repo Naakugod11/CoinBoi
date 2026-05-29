@@ -1,7 +1,8 @@
-// Entry point: reconcile (blocking) → safety loop → decision loop → log ready.
-// See spec §2.3, §2.4. Both loops share tradeMutex from mutex.ts.
+// Entry point. Sequence: reconcile (blocking) → telegram bot → dashboard →
+// safety loop → decision loop → reconciler loop → schedule daily review.
 // Paper mode: no wallet funded, no real swaps. All safety logic still runs.
-import { initDb, nowUtc, listOpenPositions, getRecentDecisions } from './observability/db.js';
+// See spec §2.3, §2.4, §5.2, §5.3, §4.2.
+import { initDb, nowUtc, getDb, listOpenPositions, getRecentDecisions } from './observability/db.js';
 import { scheduleLoop } from './agent/scheduler.js';
 import { runSafetyCycle } from './agent/safety-loop.js';
 import { runDecisionCycle } from './agent/decision-loop.js';
@@ -9,8 +10,11 @@ import { runReconciler } from './agent/reconciler.js';
 import { recordHeartbeat } from './agent/heartbeat.js';
 import { askDecision } from './agent/claude-client.js';
 import { buildDecisionPrompt, formatPortfolioForPrompt } from './agent/prompts.js';
+import { scheduleDailyReview } from './agent/review.js';
+import { createAndLaunchBot, makeBotAlert } from './observability/telegram.js';
+import { startDashboard } from './observability/dashboard.js';
 import {
-  EXECUTION_MODE, DB_PATH,
+  EXECUTION_MODE, DB_PATH, ENV,
   DECISION_LOOP_INTERVAL_MS, DECISION_LOOP_JITTER_MS,
   SAFETY_LOOP_INTERVAL_MS, RECONCILER_INTERVAL_MS,
   SAFETY, HEARTBEAT_MAX_AGE_HOURS,
@@ -18,13 +22,21 @@ import {
 import type { DecisionCycleDeps } from './agent/decision-loop.js';
 import type { SafetyLoopDeps } from './agent/safety-loop.js';
 import type { ReconcilerDeps } from './agent/reconciler.js';
+import type { HaltDeps } from './agent/halt-handler.js';
 
-// ── Paper-mode stubs (Day 4a — no wallet, no mainnet) ────────────────────────
+// ── Alert stub — replaced by real Telegram once bot is live ──────────────────
+
+let alertFn: (msg: string) => Promise<void> = async (msg) => {
+  // eslint-disable-next-line no-console
+  console.log(`[alert] ${msg}`);
+};
+
+// ── Paper-mode stubs (no wallet, no mainnet) ──────────────────────────────────
 
 const paperSafetyDeps: SafetyLoopDeps = {
-  canonicalPrice: async (_mint, _size) => null, // no price in paper mode yet
-  getSolBalance: async () => 1.0,               // pretend we have SOL
-  getUsdcBalance: async () => 25.0,             // pretend $25 cash
+  canonicalPrice: async (_mint, _size) => null,
+  getSolBalance: async () => 1.0,
+  getUsdcBalance: async () => 25.0,
   marketSellPosition: async (pos) => {
     // eslint-disable-next-line no-console
     console.log(`[paper] would sell position ${pos.token}`);
@@ -33,10 +45,7 @@ const paperSafetyDeps: SafetyLoopDeps = {
     // eslint-disable-next-line no-console
     console.log('[paper] would market-sell-all');
   },
-  alert: async (msg) => {
-    // eslint-disable-next-line no-console
-    console.log(`[alert] ${msg}`);
-  },
+  alert: async (msg) => alertFn(msg),
 };
 
 const paperReconcilerDeps: ReconcilerDeps = {
@@ -44,22 +53,21 @@ const paperReconcilerDeps: ReconcilerDeps = {
   checkTxStatus: async () => 'unknown',
   parseSwap: async () => ({ usdcAmount: 0, tokenAmount: 0, feeUsdc: 0 }),
   canonicalPrice: async () => null,
-  alert: async (msg) => {
-    // eslint-disable-next-line no-console
-    console.log(`[reconciler] ${msg}`);
-  },
+  alert: async (msg) => alertFn(msg),
 };
 
 function paperDecisionDeps(): DecisionCycleDeps {
   return {
     getSolBalance: async () => 1.0,
     getWalletTokenBalance: async () => 0,
-    buildUniverse: async () => [],            // no universe in paper mode yet
+    buildUniverse: async () => [],
     getSignals: async () => '{}',
     getRecentDecisions: (n) => {
       const rows = getRecentDecisions(n);
       if (rows.length === 0) return 'No previous decisions.';
-      return rows.map(r => `${r.timestamp_utc}: ${r.action} ${r.token ?? ''} — ${r.skip_reason ?? 'validated'}`).join('\n');
+      return rows
+        .map((r) => `${r.timestamp_utc}: ${r.action} ${r.token ?? ''} — ${r.skip_reason ?? 'validated'}`)
+        .join('\n');
     },
     askClaude: async (prompt) => askDecision(prompt),
     getQuote: async (_token, _sizeUsdc, _sizeTokens) => {
@@ -69,10 +77,7 @@ function paperDecisionDeps(): DecisionCycleDeps {
       // eslint-disable-next-line no-console
       console.log(`[paper] would execute ${decision.action} ${decision.token ?? ''} $${decision.size_usdc ?? ''}`);
     },
-    alert: async (msg) => {
-      // eslint-disable-next-line no-console
-      console.log(`[alert] ${msg}`);
-    },
+    alert: async (msg) => alertFn(msg),
   };
 }
 
@@ -92,14 +97,55 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Safety loop — 15s, no jitter (must be tight)
+  // ── Telegram bot ──────────────────────────────────────────────────────────
+
+  const tgToken = ENV.TELEGRAM_BOT_TOKEN;
+  const tgChatId = ENV.TELEGRAM_CHAT_ID ?? '';
+  const tgAuthId = ENV.TELEGRAM_AUTHORIZED_USER_ID ?? '';
+
+  if (tgToken) {
+    const paperHaltDeps: HaltDeps = {
+      marketSellAllWithRetry: paperSafetyDeps.marketSellAllWithRetry,
+      alert: async (msg) => alertFn(msg),
+    };
+
+    const bot = createAndLaunchBot(tgToken, {
+      chatId: tgChatId,
+      authorizedUserId: tgAuthId,
+      haltDeps: paperHaltDeps,
+    });
+
+    // Upgrade alertFn to real Telegram — wrap to normal priority by default
+    const botAlert = makeBotAlert(bot, tgChatId);
+    alertFn = async (msg) => botAlert('normal', msg);
+
+    // eslint-disable-next-line no-console
+    console.log('[main] Telegram bot launched');
+  } else {
+    // eslint-disable-next-line no-console
+    console.warn('[main] TELEGRAM_BOT_TOKEN not set — alerts are console-only');
+  }
+
+  // ── Dashboard ─────────────────────────────────────────────────────────────
+
+  const dashServer = await startDashboard({
+    port: ENV.DASHBOARD_PORT,
+    host: ENV.DASHBOARD_HOST,
+  });
+  const dashAddr = dashServer.address() as { address: string; port: number };
+  // eslint-disable-next-line no-console
+  console.log(`[main] Dashboard on http://${dashAddr.address}:${dashAddr.port}`);
+
+  // ── Safety loop — 15s, no jitter ─────────────────────────────────────────
+
   scheduleLoop(
     'safety',
     () => runSafetyCycle(paperSafetyDeps),
     SAFETY_LOOP_INTERVAL_MS,
   );
 
-  // Decision loop — 3 min ± 30s jitter (spec §1)
+  // ── Decision loop — 3 min ± 30s jitter ───────────────────────────────────
+
   scheduleLoop(
     'decision',
     () => runDecisionCycle(paperDecisionDeps()),
@@ -107,15 +153,33 @@ async function main(): Promise<void> {
     { jitterMs: DECISION_LOOP_JITTER_MS },
   );
 
-  // Periodic reconciler — every 5 min
+  // ── Periodic reconciler — every 5 min ────────────────────────────────────
+
   scheduleLoop(
     'reconciler',
     () => runReconciler(paperReconcilerDeps).then(() => {}),
     RECONCILER_INTERVAL_MS,
   );
 
+  // ── Daily review at 22:00 UTC ─────────────────────────────────────────────
+
+  scheduleDailyReview({
+    sendAlert: async (msg) => alertFn(msg),
+  });
+
   // eslint-disable-next-line no-console
-  console.log(`[main] agent running — paper mode, no live swaps. ${nowUtc()}`);
+  console.log(
+    `[main] Agent running — ${EXECUTION_MODE} mode. ` +
+    `Dashboard: http://${dashAddr.address}:${dashAddr.port} — ${nowUtc()}`,
+  );
+
+  void recordHeartbeat;
+  void SAFETY;
+  void HEARTBEAT_MAX_AGE_HOURS;
+  void buildDecisionPrompt;
+  void formatPortfolioForPrompt;
+  void listOpenPositions;
+  void getDb;
 }
 
 main().catch((err) => {
