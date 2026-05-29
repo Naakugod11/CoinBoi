@@ -228,4 +228,71 @@ describe('portfolio §2.7', () => {
     expect(result.lossPct).toBeCloseTo(1.0, 8);
     expect(result.currentValueUsdc).toBeCloseTo(10.0, 8);
   });
+
+  // ── Day 5 chaos tests ─────────────────────────────────────────────────────
+
+  // ── Floating-point drift over 10 ADDs ────────────────────────────────────
+  // Chaos: 10 consecutive ADDs accumulate floating-point error.
+  // Cost basis must stay within 0.01 USDC of the analytic sum.
+  // This catches silent drift that would corrupt stop-loss calculations.
+
+  it('chaos: 10 ADDs — cost basis within 0.01 USDC of analytic sum (no FP drift)', () => {
+    // OPEN + 9 ADDs = 10 total buys
+    const amounts = [5.00, 0.51, 0.73, 0.49, 0.83, 0.67, 0.91, 0.55, 0.78, 0.63];
+    const tokenAmounts = [1_000_000, 100_000, 150_000, 90_000, 160_000, 130_000, 180_000, 110_000, 145_000, 120_000];
+
+    applyOpen(BONK, tokenAmounts[0]!, amounts[0]!);
+    for (let i = 1; i < amounts.length; i++) {
+      applyAdd(BONK, tokenAmounts[i]!, amounts[i]!);
+    }
+
+    const analyticCostBasis = amounts.reduce((a, b) => a + b, 0);
+    const analyticTokens = tokenAmounts.reduce((a, b) => a + b, 0);
+
+    const pos = getPositionByToken(BONK)!;
+
+    // Within 0.01 USDC of analytic sum
+    expect(Math.abs(pos.cost_basis_total_usdc - analyticCostBasis)).toBeLessThan(0.01);
+    expect(pos.size_tokens).toBe(analyticTokens);
+
+    // Stop check uses correct combined basis
+    const breakEvenPrice = pos.cost_basis_total_usdc / pos.size_tokens;
+    const check = computeStopCheck(pos, breakEvenPrice);
+    expect(Math.abs(check.lossPct)).toBeLessThan(1e-9); // essentially zero at break-even
+  });
+
+  // ── ADD then stop: combined basis drives the stop (harden) ───────────────
+  // Chaos: three ADDs at different prices, then a large price drop.
+  // Stop must fire at exactly -40% of the TOTAL cost basis, not any individual entry.
+
+  it('chaos: 3-ADD position — stop at −40% of combined basis, not individual entry', () => {
+    // Build a position with 3 entries at different prices
+    applyOpen(BONK, 1_000_000, 5.00);      // 0.000005/token
+    applyAdd(BONK,    500_000, 2.60);      // 0.0000052/token (slightly higher)
+    applyAdd(BONK,    300_000, 1.20);      // 0.000004/token (lower — DCA down)
+    // Total: 1,800,000 tokens, cost 8.80 USDC
+    // Break-even: 8.80 / 1,800,000 = 0.000004889
+
+    const pos = getPositionByToken(BONK)!;
+    expect(pos.size_tokens).toBe(1_800_000);
+    expect(pos.cost_basis_total_usdc).toBeCloseTo(8.80, 10);
+
+    // −40% of 8.80 = 5.28 remaining value → stop price = 5.28 / 1,800,000
+    const stopValue = 8.80 * 0.60;
+    const stopPrice = stopValue / 1_800_000;
+    const atStop = computeStopCheck(pos, stopPrice);
+    expect(atStop.lossPct).toBeCloseTo(-0.40, 8);
+
+    // One tick above stop: -39.9% → should NOT trigger
+    const safePrice = (8.80 * 0.601) / 1_800_000;
+    const aboveStop = computeStopCheck(pos, safePrice);
+    expect(aboveStop.lossPct).toBeGreaterThan(-0.40);
+
+    // Verify: if we used the ORIGINAL entry price (5.00/1e6) the stop would be different
+    // and would have fired earlier or later — testing that combined basis is used
+    const wrongStopPrice = (5.00 * 0.60) / 1_000_000; // wrong: individual-entry basis
+    const wrongCheck = computeStopCheck(pos, wrongStopPrice);
+    // With combined basis of 8.80, at this price the loss is NOT exactly -40%
+    expect(wrongCheck.lossPct).not.toBeCloseTo(-0.40, 4);
+  });
 });

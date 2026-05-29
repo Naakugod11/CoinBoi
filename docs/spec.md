@@ -1180,3 +1180,9 @@ Do not skip the chaos tests. They are the difference between an agent that runs 
   wallet USDC balance, not just open positions. Empty-position state with
   cash-only otherwise reads as -100% drawdown and triggers spurious hard
   stop on startup.
+
+## §2.10 clarification (Day 5 follow-up)
+
+Untracked-token mismatch suppression applies to **PENDING/SENT/UNKNOWN_TIMEOUT** intents, **NOT to STUCK**. STUCK means the intent path has given up; a wallet showing those tokens is an unresolved physical state and trips mismatch pause. STUCK alert and mismatch pause are intended to fire together when both apply — they describe complementary aspects of the same failure.
+
+Implementation: after resolving pending intents, collect still-pending token set via `getPendingIntents().filter(i => i.status !== 'STUCK').map(i => i.token)`. Tokens in this set are skipped in the untracked check; all others (including STUCK) are checked normally.

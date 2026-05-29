@@ -259,4 +259,158 @@ describe('reconciler §2.10', () => {
     expect(isPaused()).toBe(true);
     expect(getPauseReason()).toBe('reconciler_mismatch');
   });
+
+  // ── §2.10 clarification regression: STUCK intent does NOT suppress mismatch ─
+  // STUCK means the intent path gave up. Wallet tokens without a DB position
+  // is an unresolved physical state — mismatch pause must fire.
+
+  it('STUCK intent + wallet shows tokens → mismatch pause fires (§2.10 clarification)', async () => {
+    const TOKEN_MINT = BONK;
+
+    // Create a STUCK intent (intent path gave up on this token)
+    const decId = insertDecision({ timestamp_utc: nowUtc(), action: 'OPEN', validated: true, executed: true });
+    insertIntent({
+      decision_id: decId,
+      token: TOKEN_MINT,
+      side: 'BUY',
+      size_usdc: 5,
+      quote_snapshot: '{}',
+      tx_signature: 'stuck-sig',
+      status: 'STUCK',
+      created_at_utc: new Date(Date.now() - 15 * 60 * 1000).toISOString(), // 15 min old
+    });
+
+    // Wallet shows the token with value > $0.50; no DB position
+    const deps = baseDeps({
+      getWalletBalances: vi.fn(async () => ({
+        usdcBalance: 25,
+        solBalance: 0.5,
+        tokens: [{ mint: TOKEN_MINT, uiBalance: 1_000_000 }],
+      })),
+      canonicalPrice: vi.fn(async (_mint, size) => 5.0 / size), // $5.00 value
+    });
+
+    const result = await runReconciler(deps);
+
+    // STUCK does NOT suppress → mismatch pause fires
+    expect(result.untrackedTokens).toContain(TOKEN_MINT);
+    expect(result.clean).toBe(false);
+    expect(isPaused()).toBe(true);
+    expect(getPauseReason()).toBe('reconciler_mismatch');
+  });
+
+  // ── Day 5 chaos tests ────────────────────────────────────────────────────────
+
+  // ── Dust accumulation: 5 swap residuals all <$0.50 → all ignored ──────────
+  // Chaos: after 5 swaps, small residuals litter the wallet.
+  // Reconciler must treat all as dust, not flag mismatches, not create positions.
+
+  it('chaos: 5 dust residuals in wallet (each <$0.50) — all ignored, no mismatch', async () => {
+    const dustMints = [
+      'Dust111111111111111111111111111111111111111111',
+      'Dust222222222222222222222222222222222222222222',
+      'Dust333333333333333333333333333333333333333333',
+      'Dust444444444444444444444444444444444444444444',
+      'Dust555555555555555555555555555555555555555555',
+    ];
+
+    const deps = baseDeps({
+      getWalletBalances: vi.fn(async () => ({
+        usdcBalance: 25,
+        solBalance: 0.5,
+        tokens: dustMints.map(mint => ({ mint, uiBalance: 1_000 })), // 1000 each
+      })),
+      // All dust tokens worth $0.10 each (1000 × 0.0001 = $0.10 < $0.50)
+      canonicalPrice: vi.fn(async () => 0.0001),
+    });
+
+    const result = await runReconciler(deps);
+
+    expect(result.untrackedTokens).toHaveLength(0);
+    expect(result.clean).toBe(true);
+    expect(isPaused()).toBe(false);
+  });
+
+  // ── Bug found and fixed: in-flight trade → wallet shows token but no DB position ──
+  // Chaos: SENT intent exists (tx finalized but RPC still shows 'unknown').
+  // Wallet already shows the tokens. Reconciler must NOT flag as untracked.
+  // Before fix: reconciler flagged it as an untracked mismatch.
+  // After fix: pending intent exempts token from untracked check.
+
+  it('chaos: SENT intent in flight + wallet shows tokens (RPC lag) → NOT flagged as mismatch', async () => {
+    const TOKEN_MINT = BONK;
+
+    // Create a SENT intent for BONK (BUY)
+    const decId = insertDecision({ timestamp_utc: nowUtc(), action: 'OPEN', validated: true, executed: true });
+    insertIntent({
+      decision_id: decId,
+      token: TOKEN_MINT,
+      side: 'BUY',
+      size_usdc: 5,
+      quote_snapshot: '{}',
+      tx_signature: 'in-flight-sig',
+      status: 'SENT',
+      created_at_utc: nowUtc(), // young enough not to become STUCK
+    });
+
+    // Wallet already shows BONK (tx settled on-chain but RPC reports unknown)
+    const deps = baseDeps({
+      getWalletBalances: vi.fn(async () => ({
+        usdcBalance: 25,
+        solBalance: 0.5,
+        tokens: [{ mint: TOKEN_MINT, uiBalance: 1_000_000 }],
+      })),
+      // RPC still shows unknown (lag scenario)
+      checkTxStatus: vi.fn(async () => 'unknown' as const),
+      canonicalPrice: vi.fn(async (_mint, size) => 5.0 / size),
+    });
+
+    const result = await runReconciler(deps);
+
+    // Must NOT flag the in-flight token as untracked
+    expect(result.untrackedTokens).toHaveLength(0);
+    expect(result.clean).toBe(true);
+    expect(isPaused()).toBe(false);
+  });
+
+  // ── Reconciler with concurrent live trade: SENT intent resolves to CONFIRMED ─
+  // Chaos: reconciler runs while a trade is in-flight (just sent, tx processing).
+  // The tx finalizes during this reconcile run. Reconciler must apply it and be clean.
+
+  it('chaos: trade finalizes during reconcile run — intent resolved and position created', async () => {
+    const TOKEN_MINT = WIF;
+
+    const decId = insertDecision({ timestamp_utc: nowUtc(), action: 'OPEN', validated: true, executed: true });
+    insertIntent({
+      decision_id: decId,
+      token: TOKEN_MINT,
+      side: 'BUY',
+      size_usdc: 5,
+      quote_snapshot: '{}',
+      tx_signature: 'just-finalized-sig',
+      status: 'SENT',
+      created_at_utc: nowUtc(),
+    });
+
+    const deps = baseDeps({
+      getWalletBalances: vi.fn(async () => ({
+        usdcBalance: 20,
+        solBalance: 0.5,
+        tokens: [{ mint: TOKEN_MINT, uiBalance: 100 }],
+      })),
+      checkTxStatus: vi.fn(async () => 'finalized' as const),
+      parseSwap: vi.fn(async () => ({ usdcAmount: 4.80, tokenAmount: 100, feeUsdc: 0.001 })),
+      canonicalPrice: vi.fn(async () => 4.80 / 100),
+    });
+
+    const result = await runReconciler(deps);
+
+    expect(result.pendingIntentsResolved).toBe(1);
+    expect(result.clean).toBe(true);
+
+    const pos = getPositionByToken(TOKEN_MINT);
+    expect(pos).toBeDefined();
+    expect(pos?.size_tokens).toBe(100);
+    expect(pos?.cost_basis_total_usdc).toBeCloseTo(4.80, 5);
+  });
 });

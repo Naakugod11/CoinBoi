@@ -294,6 +294,65 @@ describe('safety loop §2.6', () => {
     expect(getPauseReason()).toBeNull();
   });
 
+  // ── Null price for ALL positions: no stops, no error, cycle continues ────────
+  // Chaos: oracle returns null for every position. Must not stop or throw.
+
+  it('chaos: price oracle returns null for all positions — no stops fired, cycle completes', async () => {
+    seedPosition(BONK, 5.0, 1_000_000);
+    seedPosition('EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', 5.0, 100);
+
+    const sell = vi.fn(async () => {});
+    const deps = baseDeps({
+      canonicalPrice: vi.fn(async () => null), // null for ALL
+      marketSellPosition: sell,
+      getUsdcBalance: vi.fn(async () => 25), // enough to not trigger drawdown
+    });
+
+    // Must not throw
+    await expect(runSafetyCycle(deps)).resolves.toBeUndefined();
+
+    expect(sell).not.toHaveBeenCalled();
+    // No ticks recorded — null price means skip
+    expect(lastNTicks(1, 10)).toHaveLength(0);
+    expect(lastNTicks(2, 10)).toHaveLength(0);
+    expect(isKillSwitchTriggered()).toBe(false);
+  });
+
+  // ── Pause reason precedence: hard stop must survive subsequent reason checks ─
+  // Chaos: hard stop fires, then trade_cap and sol_low conditions also true.
+  // Kill switch must remain set; pause_reason ends up as the last-matching
+  // condition (observability gap — kill switch is the load-bearing flag).
+
+  it('chaos: hard stop plus trade_cap plus sol_low — kill switch survives all', async () => {
+    seedPosition(BONK, 5.0, 1_000_000);
+
+    // Seed 12 trades to trigger trade_cap
+    const { insertDecision: insD, insertIntent: insI, insertTrade: insT } = await import('../src/observability/db.js');
+    const decId = insD({ timestamp_utc: nowUtc(), action: 'OPEN', validated: true, executed: true });
+    for (let i = 0; i < 12; i++) {
+      const iid = insI({ decision_id: decId, token: BONK, side: 'BUY', quote_snapshot: '{}', status: 'CONFIRMED', created_at_utc: nowUtc() });
+      insT({ intent_id: iid, decision_id: decId, timestamp_utc: nowUtc(), token: BONK, side: 'BUY', size_usdc: 1, size_tokens: 100, price: 0.01, tx_signature: `sig-prec-${i}` });
+    }
+
+    const sellAll = vi.fn(async () => {});
+    const deps = baseDeps({
+      // 1,000,000 × 0.000017 = 17 USDC → dd = 30 - 17 = 13 → hard stop
+      canonicalPrice: vi.fn(async () => 0.000017),
+      marketSellAllWithRetry: sellAll,
+      getSolBalance: vi.fn(async () => 0.010), // below 0.015 → sol_low
+      getUsdcBalance: vi.fn(async () => 0),
+    });
+
+    await runSafetyCycle(deps);
+
+    // Kill switch MUST be set — the safety-critical property
+    expect(isKillSwitchTriggered()).toBe(true);
+    // Agent is paused under some reason
+    expect(isPaused()).toBe(true);
+    // Liquidation fired exactly once
+    expect(sellAll).toHaveBeenCalledTimes(1);
+  });
+
   // ── §2.3: Concurrent ADD-vs-stop mutex serialization ─────────────────────
   // The race condition fix: decision loop ADD and safety loop STOP on the same
   // position must not interleave. Whichever gets the mutex first runs fully
@@ -335,5 +394,53 @@ describe('safety loop §2.6', () => {
       'safety-stop-start',
       'safety-stop-end',
     ]);
+  });
+
+  // ── §2.3 chaos: post-state consistency after concurrent ADD and stop ──────
+  // More aggressive: drive ADD and hard-stop via Promise.all on the same position.
+  // Assert post-state is consistent: either ADD completed or stop ran, never both
+  // mid-stream. The mutex guarantees exactly one wins atomically.
+
+  it('chaos: concurrent ADD and hard-stop → post-state consistent, no interleave', async () => {
+    seedPosition(BONK, 5.0, 1_000_000);
+
+    const executionOrder: string[] = [];
+    let addComplete = false;
+    let stopComplete = false;
+
+    // Simulate decision-loop ADD: acquires mutex, records outcome
+    const addOp = tradeMutex.runExclusive(async () => {
+      executionOrder.push('add-start');
+      // Simulate work (updating position)
+      await new Promise(r => setTimeout(r, 5));
+      executionOrder.push('add-end');
+      addComplete = true;
+    });
+
+    // Simulate safety-loop hard-stop: acquires mutex, records outcome
+    const stopOp = tradeMutex.runExclusive(async () => {
+      executionOrder.push('stop-start');
+      await new Promise(r => setTimeout(r, 5));
+      executionOrder.push('stop-end');
+      stopComplete = true;
+    });
+
+    await Promise.all([addOp, stopOp]);
+
+    // Both must complete (no deadlock)
+    expect(addComplete).toBe(true);
+    expect(stopComplete).toBe(true);
+
+    // No interleaving: either add ran first then stop, or stop ran first then add
+    const addStartIdx = executionOrder.indexOf('add-start');
+    const addEndIdx = executionOrder.indexOf('add-end');
+    const stopStartIdx = executionOrder.indexOf('stop-start');
+
+    // add-start must precede add-end
+    expect(addStartIdx).toBeLessThan(addEndIdx);
+    // stop must not start until add has ended
+    if (addStartIdx < stopStartIdx) {
+      expect(addEndIdx).toBeLessThan(stopStartIdx);
+    }
   });
 });

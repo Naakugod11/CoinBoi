@@ -219,6 +219,101 @@ describe('universe §3.3 partial-failure handling', () => {
   });
 });
 
+// ── Day 5 chaos tests ─────────────────────────────────────────────────────────
+
+describe('universe chaos §Day5', () => {
+
+  // ── Malformed / unexpected Dexscreener response ───────────────────────────
+  // Chaos: Dexscreener returns data with missing/null required fields.
+  // The universe builder must handle gracefully: token is excluded, not thrown.
+
+  it('chaos: Dexscreener returns token with null marketCap — excluded, not thrown', async () => {
+    const deps = goodDeps({
+      fetchDexscreenerTokens: vi.fn(async () => [
+        { ...GOOD_TOKEN },                            // valid
+        { mint: 'Mal1111111111111111111111111111111111111111',
+          symbol: 'MAL', name: 'Malformed',
+          marketCapUsd: null as unknown as number,    // null instead of number
+          volume24hUsd: 10_000_000 },
+      ]),
+    });
+
+    const universe = await buildUniverse(deps);
+    // Malformed token excluded; GOOD still included
+    expect(universe).toHaveLength(1);
+    expect(universe[0]!.symbol).toBe('GOOD');
+  });
+
+  it('chaos: Dexscreener returns empty array (no candidates) — universe is empty, no throw', async () => {
+    const deps = goodDeps({
+      fetchDexscreenerTokens: vi.fn(async () => []),
+    });
+    const universe = await buildUniverse(deps);
+    expect(universe).toHaveLength(0);
+  });
+
+  // ── Token fails a gate between cycles (mcap drops below $50M) ─────────────
+  // Chaos: a token that passed in cycle N fails in cycle N+1.
+  // Universe for N+1 must be empty; existing position can still be managed.
+
+  it('chaos: token mcap drops below $50M between cycles — disappears cleanly', async () => {
+    // Cycle 1: GOOD token passes all gates
+    const firstCycle = await buildUniverse(goodDeps());
+    expect(firstCycle).toHaveLength(1);
+
+    // Cycle 2: same token, mcap dropped to $40M (below $50M threshold)
+    const secondCycle = await buildUniverse(goodDeps({
+      fetchDexscreenerTokens: vi.fn(async () => [{
+        ...GOOD_TOKEN,
+        marketCapUsd: 40_000_000, // dropped below gate
+      }]),
+    }));
+    expect(secondCycle).toHaveLength(0);
+
+    // The universe cleanly disappears — no error, no stale entry
+    // Decision loop can still EXIT positions regardless (universe only gates OPEN/ADD)
+  });
+
+  // ── Single Dexscreener 500 for one token via adversarial gate failure ──────
+  // Chaos: one token's adversarial data fetch fails (simulates per-token API error).
+  // Others in universe continue.
+
+  it('chaos: adversarial gate fetch fails for one token — others continue', async () => {
+    const SECOND_MINT = 'Second111111111111111111111111111111111111111';
+    const SECOND_TOKEN = { ...GOOD_TOKEN, mint: SECOND_MINT, symbol: 'SECOND' };
+
+    const deps = goodDeps({
+      fetchDexscreenerTokens: vi.fn(async () => [GOOD_TOKEN, SECOND_TOKEN]),
+      // Holder concentration fetch fails for SECOND only
+      fetchHolderConcentration: vi.fn(async (mint: string) => {
+        if (mint === SECOND_MINT) throw new Error('API 500 for this token');
+        return 0.25;
+      }),
+    });
+
+    const universe = await buildUniverse(deps);
+    // SECOND excluded due to error; GOOD still present
+    expect(universe).toHaveLength(1);
+    expect(universe[0]!.symbol).toBe('GOOD');
+    expect(universe[0]!.mint).toBe(GOOD_TOKEN.mint);
+  });
+
+  // ── Total Dexscreener outage: decision loop still alive for existing positions ─
+  // Chaos: Dexscreener throws. Universe = ∅. Decision loop can still EXIT.
+  // This tests the fail-closed + EXIT-always-allowed property of the spec.
+
+  it('chaos: total Dexscreener outage returns empty universe (fail closed)', async () => {
+    const deps = goodDeps({
+      fetchDexscreenerTokens: vi.fn(async () => { throw new Error('503 Service Unavailable'); }),
+    });
+    const universe = await buildUniverse(deps);
+    // Fail closed: empty universe, no throw
+    expect(universe).toHaveLength(0);
+    // EXIT is decided by the decision loop based on open positions, not universe membership
+    // (universe membership only gates OPEN/ADD — spec §2.5)
+  });
+});
+
 // ── Gate predicate unit tests (fast, no I/O) ──────────────────────────────────
 
 describe('universe gate predicates', () => {

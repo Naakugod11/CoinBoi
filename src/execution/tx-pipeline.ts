@@ -105,7 +105,18 @@ export async function execute(req: TxRequest, deps: TxPipelineDeps): Promise<TxR
   updateIntent(intentId, { tx_signature: sig, status: 'SENT' });
 
   // ── Step 3: Poll for finalized confirmation ───────────────────────────────
-  const pollResult = await pollUntilFinalized(sig, { timeoutMs: 90_000, ...heliusOpts });
+  // Network errors (fetch throws) are treated as UNKNOWN, not crashes: the swap
+  // was sent and the signature is recorded; reconciler resolves UNKNOWN_TIMEOUT.
+  let pollResult: Awaited<ReturnType<typeof pollUntilFinalized>>;
+  try {
+    pollResult = await pollUntilFinalized(sig, { timeoutMs: 90_000, ...heliusOpts });
+  } catch (err) {
+    updateIntent(intentId, { status: 'UNKNOWN_TIMEOUT' });
+    await alertFn(
+      `Poll network error for ${sig}: ${err}. Intent ${intentId} marked UNKNOWN_TIMEOUT — reconciler will resolve.`
+    );
+    return { outcome: 'UNKNOWN_TIMEOUT', intentId, txSignature: sig };
+  }
 
   if (pollResult.status === 'FAILED') {
     updateIntent(intentId, { status: 'CHAIN_FAILED', resolved_at_utc: nowUtc() });

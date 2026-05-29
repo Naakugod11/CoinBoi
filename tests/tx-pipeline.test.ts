@@ -287,9 +287,11 @@ describe('tx-pipeline', () => {
     expect(intent?.error).toContain('network timeout');
   });
 
-  // ── Crash between SENT and confirm leaves resolvable SENT intent ──────────
+  // ── Network error during poll → UNKNOWN_TIMEOUT (not throw) ─────────────
+  // After the bug fix: poll network errors are caught and set UNKNOWN_TIMEOUT.
+  // The intent is left in a state the reconciler can resolve.
 
-  it('crash after SENT leaves a SENT intent for the reconciler', async () => {
+  it('network error during poll → UNKNOWN_TIMEOUT (not thrown), reconciler-resolvable', async () => {
     const swapSig = 'crash_test_sig_' + Date.now();
     const executor = makeExecutor({
       swap: vi.fn(async () => ({
@@ -300,9 +302,9 @@ describe('tx-pipeline', () => {
       })),
     });
 
-    // Helius throws after the swap is sent (simulating a process crash)
+    // Helius throws — simulates network partition after swap is sent
     const crashFetch = vi.fn(async () => {
-      throw new Error('simulated crash during poll');
+      throw new Error('simulated network error during poll');
     }) as unknown as typeof fetch;
 
     const deps: TxPipelineDeps = {
@@ -310,13 +312,15 @@ describe('tx-pipeline', () => {
       heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY, fetchFn: crashFetch },
     };
 
-    await expect(execute(makeRequest(decisionId), deps)).rejects.toThrow('simulated crash');
+    // After fix: does NOT throw — returns UNKNOWN_TIMEOUT
+    const result = await execute(makeRequest(decisionId), deps);
+    expect(result.outcome).toBe('UNKNOWN_TIMEOUT');
+    expect(result.txSignature).toBe(swapSig);
 
-    // Intent must be SENT (written before crash) — reconciler can pick it up
-    const pending = getPendingIntents();
-    const sentIntent = pending.find(i => i.tx_signature === swapSig);
-    expect(sentIntent).toBeDefined();
-    expect(sentIntent?.status).toBe('SENT');
+    // Intent is in UNKNOWN_TIMEOUT with the signature preserved — reconciler can resolve
+    const intent = getIntent(result.intentId);
+    expect(intent?.status).toBe('UNKNOWN_TIMEOUT');
+    expect(intent?.tx_signature).toBe(swapSig);
   });
 
   // ── CHAIN_FAILED ──────────────────────────────────────────────────────────
@@ -333,5 +337,190 @@ describe('tx-pipeline', () => {
     const intent = getIntent(result.intentId);
     expect(intent?.status).toBe('CHAIN_FAILED');
     expect(intent?.resolved_at_utc).toBeTruthy();
+  });
+});
+
+// ── Day 5 chaos tests ─────────────────────────────────────────────────────────
+
+describe('tx-pipeline chaos §Day5', () => {
+  let dbPath: string;
+  let decisionId: number;
+
+  beforeEach(() => {
+    dbPath = tempDb();
+    initDb(dbPath);
+    decisionId = insertDecision({
+      timestamp_utc: nowUtc(),
+      action: 'OPEN',
+      token: 'BONK',
+      validated: true,
+      executed: true,
+    });
+  });
+
+  afterEach(() => {
+    closeDb();
+    for (const ext of ['', '-wal', '-shm']) {
+      const p = dbPath + ext;
+      if (existsSync(p)) rmSync(p);
+    }
+  });
+
+  // ── Bug found and fixed: poll fetch error → UNKNOWN_TIMEOUT (not throw) ────
+  // Chaos: network error mid-poll. Swap was sent, sig is recorded.
+  // Before fix: execute() threw and left intent in SENT.
+  // After fix: UNKNOWN_TIMEOUT is set, reconciler resolves.
+
+  it('chaos: network error during poll → UNKNOWN_TIMEOUT, not thrown, reconciler path left clean', async () => {
+    const swapSig = 'poll-fetch-error-sig-' + Date.now();
+    const executor = makeExecutor({
+      swap: vi.fn(async () => ({
+        signature: swapSig,
+        inputAmount: 5,
+        outputAmount: 990_000,
+        explorerUrl: '',
+      })),
+    });
+
+    let callCount = 0;
+    const fetchThatErrors: typeof fetch = vi.fn(async (_url, init) => {
+      const body = JSON.parse((init?.body ?? '{}') as string) as { method: string };
+      if (body.method === 'getSignatureStatuses') {
+        callCount++;
+        if (callCount >= 1) throw new Error('network partition — RPC unreachable');
+      }
+      return new Response('{}', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const alerts: string[] = [];
+    const deps: TxPipelineDeps = {
+      executor,
+      heliusOpts: {
+        rpcUrl: HELIUS_URL,
+        walletPublicKey: WALLET_PUBKEY,
+        fetchFn: fetchThatErrors,
+      },
+      alertFn: async (msg) => { alerts.push(msg); },
+    };
+
+    // Must NOT throw — must return UNKNOWN_TIMEOUT
+    const result = await execute(makeRequest(decisionId), deps);
+
+    expect(result.outcome).toBe('UNKNOWN_TIMEOUT');
+    expect(result.txSignature).toBe(swapSig);
+
+    const intent = getIntent(result.intentId);
+    expect(intent?.status).toBe('UNKNOWN_TIMEOUT');
+    expect(intent?.tx_signature).toBe(swapSig); // sig is preserved for reconciler
+
+    // Alert must fire so operator knows
+    expect(alerts.some(a => a.includes('UNKNOWN_TIMEOUT'))).toBe(true);
+  });
+
+  // ── Crash-then-restart: SENT intent resolved by reconciler ────────────────
+  // Chaos: process crashes between swap send and poll.
+  // On restart, reconciler finds the SENT intent and applies the finalized tx.
+
+  it('chaos: crash after SENT → reconciler resolves to CONFIRMED and creates position', async () => {
+    const { runReconciler } = await import('../src/agent/reconciler.js');
+    const { applyTradeToPosition } = await import('../src/execution/portfolio.js');
+
+    const swapSig = 'crash-restart-sig-' + Date.now();
+    const executor = makeExecutor({
+      swap: vi.fn(async () => ({
+        signature: swapSig,
+        inputAmount: 5,
+        outputAmount: 990_000,
+        explorerUrl: '',
+      })),
+    });
+
+    const crashFetch = vi.fn(async () => {
+      throw new Error('simulated crash');
+    }) as unknown as typeof fetch;
+
+    // "Crash" — intent written SENT but poll throws
+    const pipeResult = await execute(makeRequest(decisionId), {
+      executor,
+      heliusOpts: { rpcUrl: HELIUS_URL, walletPublicKey: WALLET_PUBKEY, fetchFn: crashFetch },
+    });
+
+    // After fix, this is UNKNOWN_TIMEOUT (not a throw), not SENT
+    // But the sig is written and reconciler can work
+    expect(['UNKNOWN_TIMEOUT', 'SEND_FAILED']).toContain(pipeResult.outcome);
+    expect(pipeResult.txSignature).toBe(swapSig);
+
+    // "Restart": reconciler runs, sees the unresolved intent, tx is finalized
+    const { getPositionByToken } = await import('../src/observability/db.js');
+
+    const reconcilerDeps = {
+      getWalletBalances: vi.fn(async () => ({
+        usdcBalance: 20,
+        solBalance: 0.5,
+        tokens: [{ mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', uiBalance: 990_000 }],
+      })),
+      checkTxStatus: vi.fn(async () => 'finalized' as const),
+      parseSwap: vi.fn(async () => ({ usdcAmount: 5.025, tokenAmount: 990_000, feeUsdc: 0.001 })),
+      canonicalPrice: vi.fn(async (_mint: string, size: number) => 5.0 / size),
+      alert: vi.fn(async () => {}),
+      applyTradeToPosition,
+    };
+
+    const recon = await runReconciler(reconcilerDeps);
+    expect(recon.clean).toBe(true);
+    expect(recon.pendingIntentsResolved).toBe(1);
+
+    // Position must exist after reconciler applied the trade
+    const pos = getPositionByToken('DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263');
+    expect(pos).toBeDefined();
+    expect(pos?.size_tokens).toBe(990_000);
+  });
+
+  // ── Concurrent execute() on same decisionId creates two intents ───────────
+  // Chaos: two threads both pass all gates and call execute() concurrently.
+  // Documents: the pipeline has NO DB-level uniqueness guard on decision_id.
+  // The mutex in decision-loop.ts is the ONLY guard. If bypassed, two swaps fire.
+
+  it('chaos: concurrent execute() on same decisionId — two intent rows created (relies on mutex)', async () => {
+    const swapCount = { n: 0 };
+    const executor = makeExecutor({
+      swap: vi.fn(async () => {
+        swapCount.n++;
+        return {
+          signature: `concurrent-sig-${swapCount.n}-${Date.now()}`,
+          inputAmount: 5,
+          outputAmount: 990_000,
+          explorerUrl: '',
+        };
+      }),
+    });
+
+    const deps: TxPipelineDeps = {
+      executor,
+      heliusOpts: {
+        rpcUrl: HELIUS_URL,
+        walletPublicKey: WALLET_PUBKEY,
+        fetchFn: makeHeliusFetch({}),
+      },
+    };
+
+    // Fire both concurrently — no mutex here
+    const [r1, r2] = await Promise.all([
+      execute(makeRequest(decisionId), deps),
+      execute(makeRequest(decisionId), deps),
+    ]);
+
+    // Two intent rows were created (pipeline has no decision_id uniqueness guard)
+    // This is expected behavior — the guard lives in decision-loop.ts mutex
+    expect(r1.intentId).not.toBe(r2.intentId);
+
+    // Both swaps fired (double-spend scenario if mutex bypassed)
+    expect(swapCount.n).toBe(2);
+
+    // Verify: this IS the failure mode the mutex prevents
+    const { getPendingIntents } = await import('../src/observability/db.js');
+    // All intents for this decision should be resolved now
+    const pending = getPendingIntents().filter(i => i.decision_id === decisionId);
+    expect(pending).toHaveLength(0); // both resolved (confirmed)
   });
 });

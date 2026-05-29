@@ -13,8 +13,11 @@ import { buildDecisionPrompt, formatPortfolioForPrompt } from './agent/prompts.j
 import { scheduleDailyReview } from './agent/review.js';
 import { createAndLaunchBot, makeBotAlert } from './observability/telegram.js';
 import { startDashboard } from './observability/dashboard.js';
+import { runPreflightChecks } from './preflight.js';
+import { createSwapExecutor } from './execution/sol-cli.js';
 import {
   EXECUTION_MODE, DB_PATH, ENV,
+  CLAUDE_DECISION_MODEL, CLAUDE_REVIEW_MODEL,
   DECISION_LOOP_INTERVAL_MS, DECISION_LOOP_JITTER_MS,
   SAFETY_LOOP_INTERVAL_MS, RECONCILER_INTERVAL_MS,
   SAFETY, HEARTBEAT_MAX_AGE_HOURS,
@@ -84,8 +87,17 @@ function paperDecisionDeps(): DecisionCycleDeps {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  // eslint-disable-next-line no-console
-  console.log(`[main] CoinBoi starting — mode=${EXECUTION_MODE} db=${DB_PATH}`);
+  // ── Pre-flight: catch config errors before any loop or alert fires ────────
+  runPreflightChecks({
+    executionMode: EXECUTION_MODE,
+    env: process.env as Record<string, string>,
+    executor: createSwapExecutor(),
+    dbPath: DB_PATH,
+    decisionModel: CLAUDE_DECISION_MODEL,
+    reviewModel: CLAUDE_REVIEW_MODEL,
+    dashboardHost: ENV.DASHBOARD_HOST,
+    dashboardPort: ENV.DASHBOARD_PORT,
+  });
 
   initDb(DB_PATH);
 
@@ -180,6 +192,7 @@ async function main(): Promise<void> {
   void formatPortfolioForPrompt;
   void listOpenPositions;
   void getDb;
+  void nowUtc;
 }
 
 main().catch((err) => {

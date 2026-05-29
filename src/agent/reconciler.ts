@@ -98,9 +98,22 @@ export async function runReconciler(deps: ReconcilerDeps): Promise<ReconcileResu
     }
   }
 
+  // Collect tokens that still have an active in-flight intent after resolution.
+  // PENDING/SENT/UNKNOWN_TIMEOUT → suppresses the untracked check (resolution pending).
+  // STUCK → does NOT suppress: the intent path has given up; wallet tokens are
+  // evidence of an unresolved physical state and mismatch pause is correct. See §2.10.
+  const stillPendingTokens = new Set(
+    getPendingIntents()
+      .filter(i => i.status !== 'STUCK')
+      .map(i => i.token),
+  );
+
   // Step 5: every non-dust wallet token must be tracked as an open position
   for (const token of wallet.tokens) {
     if (token.uiBalance <= 0) continue;
+
+    // In-flight: a SENT intent exists for this token — resolution is pending
+    if (stillPendingTokens.has(token.mint)) continue;
 
     // Dust check: skip tokens worth < $0.50
     const price = await deps.canonicalPrice(token.mint, token.uiBalance);

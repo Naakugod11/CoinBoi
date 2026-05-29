@@ -144,3 +144,142 @@ describe('scheduler §2.4', () => {
     expect(loopB.length).toBeGreaterThanOrEqual(2);
   });
 });
+
+// ── Day 5 chaos tests ─────────────────────────────────────────────────────────
+
+describe('scheduler chaos §Day5', () => {
+
+  // ── 4-min cycle in a 3-min schedule ──────────────────────────────────────
+  // Chaos: decision cycle takes longer than its own interval.
+  // The second tick MUST detect the overlap and log a skip, not execute.
+
+  it('chaos: 4-min cycle in 3-min schedule — skip logged, no concurrent execution', async () => {
+    vi.useFakeTimers();
+
+    const INTERVAL_MS = 180_000;  // 3 min
+    const CYCLE_DURATION_MS = 240_000;  // 4 min (longer than interval)
+
+    const concurrentRuns = { count: 0, max: 0 };
+    const skips: string[] = [];
+    let resolveCycle!: () => void;
+
+    const fn = vi.fn(async () => {
+      concurrentRuns.count++;
+      concurrentRuns.max = Math.max(concurrentRuns.max, concurrentRuns.count);
+      await new Promise<void>(r => { resolveCycle = r; });
+      concurrentRuns.count--;
+    });
+
+    const handle = scheduleLoop('decision', fn, INTERVAL_MS, {
+      onSkip: (_name, reason) => skips.push(reason),
+    });
+
+    // Fire first cycle (3-min mark)
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(fn).toHaveBeenCalledTimes(1);
+
+    // 3 more minutes pass — second tick fires but cycle is still running
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(fn).toHaveBeenCalledTimes(1); // still 1 — second tick was skipped
+    expect(skips.length).toBeGreaterThanOrEqual(1);
+    expect(skips[0]).toMatch(/previous cycle still running/);
+
+    // Unblock the 4-min cycle
+    resolveCycle();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Concurrency was always serialized
+    expect(concurrentRuns.max).toBe(1);
+
+    handle.stop();
+  });
+
+  // ── onCycleDone fires with elapsed time on every tick ─────────────────────
+  // Observability: §2.4 requires elapsed time to be logged.
+
+  it('onCycleDone fires with positive elapsedMs after every tick', async () => {
+    vi.useFakeTimers();
+
+    const elapsed: number[] = [];
+    const handle = scheduleLoop(
+      'obs-test',
+      async () => {
+        // Real work takes some time (simulated via fake time advance in test)
+      },
+      50,
+      { onCycleDone: (_name, ms) => elapsed.push(ms) },
+    );
+
+    await vi.advanceTimersByTimeAsync(250);
+    handle.stop();
+
+    expect(elapsed.length).toBeGreaterThanOrEqual(4);
+    // elapsed time is always a non-negative number
+    for (const ms of elapsed) {
+      expect(ms).toBeGreaterThanOrEqual(0);
+      expect(typeof ms).toBe('number');
+    }
+  });
+
+  // ── Jitter is bounded over many cycles ────────────────────────────────────
+  // Tests: (a) all 10 cycles fire, (b) total time is within expected bounds,
+  // (c) jitter never causes more than ~2 fires per 2×interval window.
+
+  it('jitter bounded: at least N ticks fire in N×MAX_DELAY ms, no tick is skipped', async () => {
+    vi.useFakeTimers();
+
+    const INTERVAL = 100;
+    const JITTER = 30;
+    const MAX_DELAY = INTERVAL + JITTER; // 130ms per tick at worst
+    const MIN_DELAY = INTERVAL - JITTER; // 70ms per tick at best
+    const N = 10;
+    let cycleCount = 0;
+
+    const handle = scheduleLoop(
+      'jitter-bound',
+      async () => { cycleCount++; },
+      INTERVAL,
+      { jitterMs: JITTER },
+    );
+
+    // Advance exactly N × MAX_DELAY: guarantees at least N ticks fired
+    await vi.advanceTimersByTimeAsync(N * MAX_DELAY);
+    handle.stop();
+
+    // Property 1: at least N ticks fired — jitter never causes a miss
+    expect(cycleCount).toBeGreaterThanOrEqual(N);
+
+    // Property 2: at most ceil(N*MAX_DELAY / MIN_DELAY) — no spurious extra fires
+    // 10 × 130 / 70 ≈ 18.6 → at most 18 ticks
+    const maxPossible = Math.ceil((N * MAX_DELAY) / MIN_DELAY);
+    expect(cycleCount).toBeLessThanOrEqual(maxPossible);
+  });
+
+  // ── Self-heal after exception: loop continues ─────────────────────────────
+  // Chaos: fn throws on odd cycles. Even cycles must still run.
+
+  it('chaos: fn throws every other tick — loop self-heals without missing ticks', async () => {
+    vi.useFakeTimers();
+
+    const results: Array<'ok' | 'error'> = [];
+    let call = 0;
+
+    const handle = scheduleLoop(
+      'flaky-loop',
+      async () => {
+        call++;
+        if (call % 2 === 1) throw new Error(`chaos error on call ${call}`);
+        results.push('ok');
+      },
+      50,
+      { onError: () => results.push('error') },
+    );
+
+    // 6 ticks = 3 errors + 3 successes
+    await vi.advanceTimersByTimeAsync(300);
+    handle.stop();
+
+    expect(results.filter(r => r === 'error').length).toBe(3);
+    expect(results.filter(r => r === 'ok').length).toBe(3);
+  });
+});
